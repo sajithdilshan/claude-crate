@@ -1,0 +1,15 @@
+{
+  "env": {
+    "CLAUDE_CODE_USE_BEDROCK": "1",
+    "AWS_REGION": "<region>",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "0"
+  },
+  "model": "arn:aws:bedrock:<region>:<account-id>:application-inference-profile/<default-profile-id>",
+  "modelOverrides": {
+    "claude-opus-4-8": "arn:aws:bedrock:<region>:<account-id>:application-inference-profile/<opus-48-profile-id>",
+    "claude-opus-4-7": "arn:aws:bedrock:<region>:<account-id>:application-inference-profile/<opus-47-profile-id>",
+    "claude-opus-4-6-v1": "arn:aws:bedrock:<region>:<account-id>:application-inference-profile/<opus-46-profile-id>",
+    "claude-sonnet-4-6": "arn:aws:bedrock:<region>:<account-id>:application-inference-profile/<sonnet-46-profile-id>",
+    "claude-haiku-4-5-20251001-v1:0": "arn:aws:bedrock:<region>:<account-id>:application-inference-profile/<haiku-45-profile-id>"
+  }
+}

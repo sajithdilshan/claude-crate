@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE=claude-crate:latest
+AWS_PROFILE="${AWS_PROFILE:-claude-crate}"
+AWS_REGION="${AWS_REGION:-eu-central-1}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Parse args: --workdir is required; --build is optional; everything else passes
+# through to claude.
+WORKDIR=""
+BUILD=0
+CLAUDE_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --workdir) WORKDIR="${2:-}"; shift 2 ;;
+    --workdir=*) WORKDIR="${1#*=}"; shift ;;
+    --build) BUILD=1; shift ;;
+    *) CLAUDE_ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [ -z "$WORKDIR" ]; then
+  echo "error: --workdir <project dir> is required" >&2
+  echo "usage: claude-crate --workdir <dir> [--build] [-- claude args...]" >&2
+  exit 1
+fi
+if [ ! -d "$WORKDIR" ]; then
+  echo "error: project dir '$WORKDIR' does not exist" >&2
+  exit 1
+fi
+WORKDIR="$(cd "$WORKDIR" && pwd)"
+
+if [ "$BUILD" -eq 1 ]; then
+  docker build -t "$IMAGE" "$SCRIPT_DIR"
+fi
+
+# Pre-flight: ensure a valid SSO session (botocore refreshes inside container).
+# Force a fresh login if the session is invalid OR expires within the next hour,
+# so it can't run out mid-session while the container is using it.
+needs_login=0
+if ! aws sts get-caller-identity --profile "$AWS_PROFILE" >/dev/null 2>&1; then
+  needs_login=1
+else
+  token_exp=$(cat "$HOME"/.aws/sso/cache/*.json 2>/dev/null \
+    | jq -r 'select(.expiresAt) | .expiresAt' | sort | tail -1)
+  if [ -n "$token_exp" ]; then
+    exp_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$token_exp" +%s 2>/dev/null \
+      || date -d "$token_exp" +%s 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    [ "$exp_epoch" -gt 0 ] && [ $((exp_epoch - now_epoch)) -lt 3600 ] && needs_login=1
+  fi
+fi
+if [ "$needs_login" -eq 1 ]; then
+  echo "→ SSO session expired or expiring soon for '$AWS_PROFILE' — logging in…"
+  aws sso login --profile "$AWS_PROFILE"
+fi
+
+# First-run: seed the dedicated config dir.
+mkdir -p "$HOME/.claude-crate"
+[ -f "$HOME/.claude-crate/settings.json" ] || \
+  cp "$SCRIPT_DIR/settings.seed.json" "$HOME/.claude-crate/settings.json"
+# Seed .claude.json (onboarding/theme state) so setup doesn't run every launch.
+[ -f "$HOME/.claude-crate/claude.json" ] || \
+  cp "$SCRIPT_DIR/claude-json.seed.json" "$HOME/.claude-crate/claude.json"
+
+# The project is mounted at its real host path inside the container so Claude
+# keeps separate session/resume history per project. Pre-trust that exact path
+# so the "do you trust this directory?" prompt is skipped.
+CJSON="$HOME/.claude-crate/claude.json"
+tmp="$(mktemp)"
+jq --arg p "$WORKDIR" \
+  '.projects[$p] = ((.projects[$p] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})' \
+  "$CJSON" > "$tmp" && mv "$tmp" "$CJSON"
+
+exec docker run --rm -it \
+  --name "claude-crate-$(basename "$WORKDIR")-$$" \
+  -v "$WORKDIR":"$WORKDIR" \
+  -w "$WORKDIR" \
+  -v "$HOME/.claude-crate":/home/agent/.claude \
+  -v "$HOME/.claude-crate/claude.json":/home/agent/.claude.json \
+  -v "$HOME/.aws":/home/agent/.aws \
+  -e CLAUDE_CODE_USE_BEDROCK=1 \
+  -e AWS_PROFILE="$AWS_PROFILE" \
+  -e AWS_REGION="$AWS_REGION" \
+  "$IMAGE" --dangerously-skip-permissions ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
