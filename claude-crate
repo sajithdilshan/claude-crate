@@ -1,21 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE=claude-crate:latest
+BASE_IMAGE=claude-crate:base
+# Auth backend: CLAUDE_CRATE_BEDROCK_ENABLED=1 (default) uses AWS Bedrock via SSO; set to 0 to
+# use the direct Anthropic API instead (forwards ANTHROPIC_API_KEY from host).
+CLAUDE_CRATE_BEDROCK_ENABLED="${CLAUDE_CRATE_BEDROCK_ENABLED:-1}"
 AWS_PROFILE="${AWS_PROFILE:-claude-crate}"
 AWS_REGION="${AWS_REGION:-eu-central-1}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve $0 through any symlinks so SCRIPT_DIR is the real repo dir, not the
+# symlink's location (e.g. ~/.local/bin). macOS has no `readlink -f`, so walk
+# the link chain manually.
+src="$0"
+while [ -L "$src" ]; do
+  target="$(readlink "$src")"
+  case "$target" in
+    /*) src="$target" ;;
+    *) src="$(dirname "$src")/$target" ;;
+  esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$src")" && pwd)"
+OVERLAY_DIR="$SCRIPT_DIR/overlays"
 
-# Parse args: --workdir is required; --build is optional; everything else passes
-# through to claude.
+# Config dir + seed are backend-specific so Bedrock's ARN model config never
+# leaks into an Anthropic-API session (and vice-versa). The dir is persistent,
+# so it must differ per backend.
+if [ "$CLAUDE_CRATE_BEDROCK_ENABLED" = "1" ]; then
+  CONFIG_DIR="$HOME/.claude-crate"
+  SEED_FILE="$SCRIPT_DIR/settings.seed.json"
+else
+  CONFIG_DIR="$HOME/.claude-crate-api"
+  SEED_FILE="$SCRIPT_DIR/settings.seed.api.json"
+fi
+
+# Parse args: --workdir is required; --build, --overlay, --with-compose are
+# optional; everything else passes through to claude.
 WORKDIR=""
 BUILD=0
+COMPOSE_NET=""
+OVERLAY=""
 CLAUDE_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --workdir) WORKDIR="${2:-}"; shift 2 ;;
     --workdir=*) WORKDIR="${1#*=}"; shift ;;
     --build) BUILD=1; shift ;;
+    --overlay) OVERLAY="${2:-}"; shift 2 ;;
+    --overlay=*) OVERLAY="${1#*=}"; shift ;;
+    --with-compose) COMPOSE_NET="${2:-}"; shift 2 ;;
+    --with-compose=*) COMPOSE_NET="${1#*=}"; shift ;;
     *) CLAUDE_ARGS+=("$1"); shift ;;
   esac
 done
@@ -31,56 +63,195 @@ if [ ! -d "$WORKDIR" ]; then
 fi
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 
-if [ "$BUILD" -eq 1 ]; then
-  docker build -t "$IMAGE" "$SCRIPT_DIR"
+# Overlays live under overlays/projects/<name> or overlays/languages/<name>.
+# Resolve a name to its dir, preferring projects/ (a project overlay may shadow
+# a language name). Prints the dir or exits with a clear error.
+overlay_dir() {
+  local name="$1" d
+  for d in "$OVERLAY_DIR/projects/$name" "$OVERLAY_DIR/languages/$name"; do
+    [ -f "$d/Dockerfile" ] && { printf '%s\n' "$d"; return 0; }
+  done
+  echo "error: overlay '$name' not found under overlays/{projects,languages}/" >&2
+  exit 1
+}
+
+# Resolve which image to run. With no --overlay, that's the base image. With an
+# overlay, walk its FROM chain (each overlay is `FROM claude-crate:<parent>`)
+# down to base, collecting the build order base -> ... -> overlay.
+IMAGE="$BASE_IMAGE"
+BUILD_CHAIN=()  # overlay names, base-first order
+if [ -n "$OVERLAY" ]; then
+  cur="$OVERLAY"
+  guard=0
+  while [ -n "$cur" ]; do
+    guard=$((guard + 1))
+    [ "$guard" -gt 20 ] && { echo "error: overlay FROM chain too deep (cycle?) at '$cur'" >&2; exit 1; }
+    od="$(overlay_dir "$cur")" || exit 1
+    df="$od/Dockerfile"
+    BUILD_CHAIN=("$cur" ${BUILD_CHAIN[@]+"${BUILD_CHAIN[@]}"})
+    parent=$(grep -iE '^[[:space:]]*FROM[[:space:]]+claude-crate:' "$df" \
+      | head -1 | sed -E 's/.*claude-crate:([A-Za-z0-9_.-]+).*/\1/')
+    [ -z "$parent" ] && { echo "error: overlay '$cur' must be FROM claude-crate:<parent>" >&2; exit 1; }
+    [ "$parent" = "base" ] && break
+    cur="$parent"
+  done
+  IMAGE="claude-crate:$OVERLAY"
 fi
 
-# Pre-flight: ensure a valid SSO session (botocore refreshes inside container).
-# Force a fresh login if the session is invalid OR expires within the next hour,
-# so it can't run out mid-session while the container is using it.
-needs_login=0
-if ! aws sts get-caller-identity --profile "$AWS_PROFILE" >/dev/null 2>&1; then
-  needs_login=1
-else
-  token_exp=$(cat "$HOME"/.aws/sso/cache/*.json 2>/dev/null \
-    | jq -r 'select(.expiresAt) | .expiresAt' | sort | tail -1)
-  if [ -n "$token_exp" ]; then
-    exp_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$token_exp" +%s 2>/dev/null \
-      || date -d "$token_exp" +%s 2>/dev/null || echo 0)
-    now_epoch=$(date +%s)
-    [ "$exp_epoch" -gt 0 ] && [ $((exp_epoch - now_epoch)) -lt 3600 ] && needs_login=1
-  fi
+if [ "$BUILD" -eq 1 ]; then
+  docker build -t "$BASE_IMAGE" "$SCRIPT_DIR"
+  for name in ${BUILD_CHAIN[@]+"${BUILD_CHAIN[@]}"}; do
+    echo "→ building overlay '$name' → claude-crate:$name"
+    od="$(overlay_dir "$name")" || exit 1
+    docker build -t "claude-crate:$name" "$od"
+  done
 fi
-if [ "$needs_login" -eq 1 ]; then
-  echo "→ SSO session expired or expiring soon for '$AWS_PROFILE' — logging in…"
-  aws sso login --profile "$AWS_PROFILE"
+
+# Reap orphans: a container name ends in its launcher's PID (…-$$). If the
+# launcher was hard-killed (closed terminal, SIGKILL), the EXIT trap never ran
+# and the container leaked. On each launch, stop any claude-crate-* container
+# whose trailing PID is no longer a live process. Live concurrent sessions keep
+# their launcher PID, so they're left running.
+for c in $(docker ps -q --filter "name=^claude-crate-" 2>/dev/null); do
+  name=$(docker inspect -f '{{.Name}}' "$c" 2>/dev/null | sed 's#^/##')
+  pid=${name##*-}
+  case "$pid" in
+    ''|*[!0-9]*) continue ;;  # name didn't end in a numeric PID — leave it
+  esac
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "→ reaping orphaned container $name (launcher PID $pid is dead)"
+    docker stop "$c" >/dev/null 2>&1 || true
+  fi
+done
+
+# Pre-flight (Bedrock only): ensure a valid SSO session (botocore refreshes
+# inside container). Force a fresh login if the session is invalid OR expires
+# within the next hour, so it can't run out mid-session while the container is
+# using it. With CLAUDE_CRATE_BEDROCK_ENABLED=0 we use the Anthropic API and skip all of this.
+if [ "$CLAUDE_CRATE_BEDROCK_ENABLED" = "1" ]; then
+  needs_login=0
+  if ! aws sts get-caller-identity --profile "$AWS_PROFILE" >/dev/null 2>&1; then
+    needs_login=1
+  else
+    token_exp=$(cat "$HOME"/.aws/sso/cache/*.json 2>/dev/null \
+      | jq -r 'select(.expiresAt) | .expiresAt' | sort | tail -1)
+    if [ -n "$token_exp" ]; then
+      exp_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$token_exp" +%s 2>/dev/null \
+        || date -d "$token_exp" +%s 2>/dev/null || echo 0)
+      now_epoch=$(date +%s)
+      [ "$exp_epoch" -gt 0 ] && [ $((exp_epoch - now_epoch)) -lt 3600 ] && needs_login=1
+    fi
+  fi
+  if [ "$needs_login" -eq 1 ]; then
+    echo "→ SSO session expired or expiring soon for '$AWS_PROFILE' — logging in…"
+    aws sso login --profile "$AWS_PROFILE"
+  fi
+elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "error: CLAUDE_CRATE_BEDROCK_ENABLED=0 but ANTHROPIC_API_KEY is not set on the host" >&2
+  exit 1
 fi
 
 # First-run: seed the dedicated config dir.
-mkdir -p "$HOME/.claude-crate"
-[ -f "$HOME/.claude-crate/settings.json" ] || \
-  cp "$SCRIPT_DIR/settings.seed.json" "$HOME/.claude-crate/settings.json"
+mkdir -p "$CONFIG_DIR"
+if [ ! -f "$CONFIG_DIR/settings.json" ]; then
+  if [ ! -f "$SEED_FILE" ]; then
+    echo "error: settings seed '$SEED_FILE' not found" >&2
+    echo "hint: copy the template — cp ${SEED_FILE}.example $(basename "$SEED_FILE") — and fill it in" >&2
+    exit 1
+  fi
+  cp "$SEED_FILE" "$CONFIG_DIR/settings.json"
+fi
 # Seed .claude.json (onboarding/theme state) so setup doesn't run every launch.
-[ -f "$HOME/.claude-crate/claude.json" ] || \
-  cp "$SCRIPT_DIR/claude-json.seed.json" "$HOME/.claude-crate/claude.json"
+[ -f "$CONFIG_DIR/claude.json" ] || \
+  cp "$SCRIPT_DIR/claude-json.seed.json" "$CONFIG_DIR/claude.json"
 
 # The project is mounted at its real host path inside the container so Claude
 # keeps separate session/resume history per project. Pre-trust that exact path
 # so the "do you trust this directory?" prompt is skipped.
-CJSON="$HOME/.claude-crate/claude.json"
+CJSON="$CONFIG_DIR/claude.json"
 tmp="$(mktemp)"
 jq --arg p "$WORKDIR" \
   '.projects[$p] = ((.projects[$p] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})' \
   "$CJSON" > "$tmp" && mv "$tmp" "$CJSON"
 
-exec docker run --rm -it \
-  --name "claude-crate-$(basename "$WORKDIR")-$$" \
+# Container-only venv: a named volume masks the host's .venv at the same path,
+# so the host's macOS-built venv (broken symlinks to /opt/homebrew) is never seen
+# inside the container, and the container's Linux venv persists across runs.
+# Volume name is derived from the project path so each project gets its own.
+VENV_VOL="claude-crate-venv-$(echo "$WORKDIR" | tr -c 'a-zA-Z0-9_.-' '_')"
+# A fresh named volume is root-owned; chown it to the agent uid (1000) once so the
+# in-container venv build can write to it. No-op on an already-initialized volume.
+if ! docker volume inspect "$VENV_VOL" >/dev/null 2>&1; then
+  docker volume create "$VENV_VOL" >/dev/null
+  docker run --rm -u 0 --entrypoint chown -v "$VENV_VOL":/v "$IMAGE" \
+    -R 1000:1000 /v
+fi
+
+# Optional: join a host docker-compose network (e.g. for a Postgres test DB).
+NET_ARGS=()
+if [ -n "$COMPOSE_NET" ]; then
+  if ! docker network inspect "$COMPOSE_NET" >/dev/null 2>&1; then
+    echo "error: docker network '$COMPOSE_NET' not found — start your compose stack first" >&2
+    echo "hint: 'docker compose up -d db' then check 'docker network ls'" >&2
+    exit 1
+  fi
+  NET_ARGS=(--network "$COMPOSE_NET")
+fi
+
+# Don't `exec`: that replaces the shell with the docker *client*, and if the
+# client is killed hard (SIGKILL, terminal hangup) it dies without telling the
+# daemon to stop the container — orphaning it. Instead run in the foreground.
+CONTAINER="claude-crate-$(basename "$WORKDIR")-$$"
+LAUNCHER_PID=$$
+
+# Trap handles the catchable exits (clean exit, Ctrl-C, TERM, terminal HUP):
+# stop the container and kill the watchdog so it doesn't linger.
+cleanup() {
+  docker stop "$CONTAINER" >/dev/null 2>&1 || true
+  [ -n "${WATCHDOG_PID:-}" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM HUP
+
+# Watchdog covers the cases the trap CANNOT: `kill -9` of the launcher and other
+# uncatchable deaths. nohup alone is NOT enough: it blocks SIGHUP but leaves the
+# watchdog in the launcher's process group/session, so a group-wide kill (e.g.
+# killing the whole job) takes the watchdog down too. perl POSIX::setsid puts it
+# in its OWN session first, then exec's the bash loop — so $! is still the loop's
+# PID for the trap to kill on clean exit, but a group kill can't reach it.
+perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' \
+  bash -c '
+    launcher=$1; container=$2
+    while kill -0 "$launcher" 2>/dev/null; do sleep 2; done
+    docker stop "$container" >/dev/null 2>&1 || true
+  ' _ "$LAUNCHER_PID" "$CONTAINER" >/dev/null 2>&1 &
+WATCHDOG_PID=$!
+disown "$WATCHDOG_PID" 2>/dev/null || true
+
+# Auth args differ by backend: Bedrock mounts ~/.aws and forwards the AWS env;
+# Anthropic API just forwards the API key. CLAUDE_CODE_USE_BEDROCK is set
+# explicitly either way so it overrides any value baked into the seed/image.
+AUTH_ARGS=()
+if [ "$CLAUDE_CRATE_BEDROCK_ENABLED" = "1" ]; then
+  AUTH_ARGS=(
+    -v "$HOME/.aws":/home/agent/.aws
+    -e CLAUDE_CODE_USE_BEDROCK=1
+    -e AWS_PROFILE="$AWS_PROFILE"
+    -e AWS_REGION="$AWS_REGION"
+  )
+else
+  AUTH_ARGS=(
+    -e CLAUDE_CODE_USE_BEDROCK=0
+    -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+  )
+fi
+
+docker run --rm -it \
+  --name "$CONTAINER" \
   -v "$WORKDIR":"$WORKDIR" \
+  -v "$VENV_VOL":"$WORKDIR/.venv" \
+  ${NET_ARGS[@]+"${NET_ARGS[@]}"} \
   -w "$WORKDIR" \
-  -v "$HOME/.claude-crate":/home/agent/.claude \
-  -v "$HOME/.claude-crate/claude.json":/home/agent/.claude.json \
-  -v "$HOME/.aws":/home/agent/.aws \
-  -e CLAUDE_CODE_USE_BEDROCK=1 \
-  -e AWS_PROFILE="$AWS_PROFILE" \
-  -e AWS_REGION="$AWS_REGION" \
+  -v "$CONFIG_DIR":/home/agent/.claude \
+  -v "$CONFIG_DIR/claude.json":/home/agent/.claude.json \
+  "${AUTH_ARGS[@]}" \
   "$IMAGE" --dangerously-skip-permissions ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}

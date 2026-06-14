@@ -1,2 +1,5 @@
 settings.seed.json
+settings.seed.api.json
+overlays/projects/
 .idea
+.claude

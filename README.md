@@ -2,25 +2,24 @@
 
 Run Claude Code with `--dangerously-skip-permissions` inside a Docker container,
 scoped to a single project directory. The container can only touch the mounted
-project dir, a dedicated config dir (`~/.claude-crate`), and `~/.aws` (for
-Bedrock auth) — not the rest of your machine.
+project dir, a dedicated config dir, and `~/.aws` (for Bedrock auth) — not the
+rest of your machine.
 
 ## How it works
 
-- **Model backend:** AWS Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`).
-- **Auth:** no static keys. `~/.aws` is mounted read-write and `AWS_PROFILE` is
-  forwarded, so botocore inside the container auto-refreshes short-lived role
-  creds from the cached SSO token — valid until the SSO session expires, not
-  ~1h. The launcher validates the session before starting and forces a re-login
-  if it is expired or expires within the next hour.
-- **Config:** a dedicated `~/.claude-crate` (seeded from `settings.seed.json` and
-  `claude-json.seed.json` on first run), kept separate from your real
-  `~/.claude` so host-only hooks/statusline/plugins don't leak in. Model
-  selection lives here in `model` + `modelOverrides`, not env vars.
-- **Persistent history:** `~/.claude-crate` survives across runs, so sessions,
-  memory, and plans are saved. Each project is mounted at its *real host path*
-  inside the container, so history is scoped per project — use `--continue` /
-  `--resume` to reopen a project's prior session.
+- **Model backend:** AWS Bedrock by default. Set `CLAUDE_CRATE_BEDROCK_ENABLED=0`
+  to use the direct Anthropic API instead — the launcher skips all SSO/AWS
+  handling and forwards `ANTHROPIC_API_KEY` from the host.
+- **Auth (Bedrock):** no static keys. `~/.aws` is mounted read-write and
+  `AWS_PROFILE` forwarded, so botocore auto-refreshes role creds from the cached
+  SSO token. The launcher re-logs in if the session is expired or expires within
+  the hour.
+- **Config:** a dedicated, backend-specific config dir, seeded on first run and
+  kept separate from your real `~/.claude` — `~/.claude-crate` (Bedrock, ARN
+  models) vs `~/.claude-crate-api` (API, plain model names), so the two never
+  pollute each other. It persists across runs (sessions, memory, plans).
+- **Per-project history:** each project is mounted at its *real host path*, so
+  history is scoped per project — use `--continue` / `--resume` to reopen it.
 
 ## One-time setup
 
@@ -52,30 +51,28 @@ cp settings.seed.json.example settings.seed.json
 # inference-profile IDs for each model.
 ```
 
-Build the image:
+For Anthropic-API mode (`CLAUDE_CRATE_BEDROCK_ENABLED=0`), create its seed the
+same way — rename the example, then adjust the default model if you like:
+
+```bash
+cp settings.seed.api.json.example settings.seed.api.json
+```
+
+Build the base image:
 
 ```bash
 cd claude-crate
-docker build -t claude-crate:latest .
-# or: ./claude-crate --workdir <project> --build   (builds, then runs)
+docker build -t claude-crate:base .
+# or: ./claude-crate --workdir <project> --build   (builds base + any overlay)
 ```
 
 ## Install to PATH (optional)
 
-Symlink the launcher into a directory on your `PATH` so you can run
-`claude-crate` from anywhere. Use a symlink (not a copy) so edits to the script
-take effect automatically — it resolves its own directory to find the seed
-files, so it keeps working through the link.
+Symlink the launcher onto your `PATH` (a symlink, not a copy, so edits and seed
+resolution keep working):
 
 ```bash
 ln -s "$PWD/claude-crate" ~/.local/bin/claude-crate   # or /usr/local/bin
-```
-
-Verify (`~/.local/bin` must be on your `PATH`):
-
-```bash
-which claude-crate
-claude-crate            # should print the "--workdir is required" usage error
 ```
 
 ## Usage
@@ -88,6 +85,7 @@ claude-crate            # should print the "--workdir is required" usage error
 ./claude-crate --workdir ~/code/myproject --resume     # pick a prior session
 ./claude-crate --workdir ~/code/myproject --version    # extra args → claude
 ./claude-crate --workdir ~/code/myproject --build      # rebuild image first
+./claude-crate --workdir ~/code/myproject --overlay python   # run a language/project overlay
 ```
 
 Multiple instances can run on the same project at once (container names get a
@@ -97,28 +95,95 @@ PID suffix). They share the same project mount, so coordinate file edits
 The launcher runs `aws sso login` automatically if needed. SSO login opens a
 browser on the host.
 
+### Image overlays (per-language / per-project deps)
+
+The base image (`claude-crate:base`) is deliberately language-agnostic — node,
+claude-code, awscli, git, nothing else. Language toolchains and project-specific
+system libs live in **overlays**, split by kind and composed in three tiers:
+
+```
+base                                       # claude-crate:base — runtime essentials
+ └ overlays/languages/python               # claude-crate:python — uv + CPython 3.12
+    └ overlays/projects/myproject          # + project-specific system libs
+```
+
+`overlays/languages/` is tracked in git (shared, reusable); `overlays/projects/`
+is **gitignored**, so private per-project configs and deps never get committed.
+
+Each overlay sets its parent via `FROM claude-crate:<parent>`. Launch with
+`--overlay <name>` (looked up under `projects/` then `languages/`): the launcher
+walks the `FROM` chain, builds it base-first (with `--build`), and runs
+`claude-crate:<name>`. With no `--overlay`, the base image runs.
+
+```bash
+./claude-crate --workdir ~/code/myproject \
+  --overlay myproject --build              # builds base → python → project, runs it
+```
+
+**Add a new project:** create `overlays/projects/<project>/Dockerfile` starting
+from a language layer (e.g. `FROM claude-crate:python`) and add its `apt-get`
+deps. **Add a new language:** create `overlays/languages/<lang>/Dockerfile` as
+`FROM claude-crate:base`. No wrapper changes needed — selection is by name.
+
+### Python projects (container-only venv)
+
+A host-built `.venv` has absolute symlinks (e.g. into `/opt/homebrew`) that are
+useless in a Linux container. So the launcher masks `<project>/.venv` with a
+**named Docker volume** — the container gets its own Linux-native venv that
+persists per project, and the host's copy stays untouched and invisible.
+
+The `python` overlay ships `uv` + CPython 3.12 (Debian's is only 3.11). Build
+the venv with `uv` inside the crate:
+
+```bash
+uv venv --python 3.12 .venv
+. .venv/bin/activate && uv pip install -r requirements.txt   # or: uv sync
+```
+
+Reset it with `docker volume rm claude-crate-venv-<munged-path>`
+(`docker volume ls` to find the name).
+
+### Postgres / docker-compose test DB (`--with-compose`)
+
+For tests needing a Postgres from the project's `docker-compose.yml`, start the
+DB **on the host** and have the crate join that compose network — the crate
+never gets Docker access, so the blast radius is unchanged.
+
+```bash
+# on the host, from the project:
+docker compose up -d db
+docker network ls                       # find the network, e.g. myproject_default
+
+# then launch the crate attached to it:
+./claude-crate --workdir ~/code/myproject --with-compose myproject_default
+```
+
+Inside the crate, connect by compose service name (e.g.
+`postgresql://user:pass@db:5432/dbname`), not `localhost`. `psql` ships in
+overlays that need it (add it to your project overlay), not the base image. The
+launcher errors if the named network doesn't exist. The agent can't start/stop
+the DB itself — control its lifecycle from the host.
+
 ### Environment overrides
 
-- `AWS_PROFILE` (default `claude-crate`)
-- `AWS_REGION` (default `eu-central-1`)
+- `CLAUDE_CRATE_BEDROCK_ENABLED` (default `1`; set `0` for the Anthropic API + `ANTHROPIC_API_KEY`)
+- `AWS_PROFILE` (default `claude-crate`; Bedrock mode only)
+- `AWS_REGION` (default `eu-central-1`; Bedrock mode only)
 
 ## Files
 
 | File                    | Purpose                                          |
 |-------------------------|--------------------------------------------------|
-| `Dockerfile`            | node:22 + claude-code (native installer) + awscli |
-| `claude-crate`          | host launcher (SSO pre-flight + `docker run`)    |
-| `settings.seed.json.example` | template for the settings seed (copy → `settings.seed.json`, fill in ARNs) |
-| `settings.seed.json`    | your settings seed with real Bedrock ARNs (gitignored) |
-| `claude-json.seed.json` | onboarding/theme state seeded into `~/.claude-crate` |
-| `.dockerignore`         | build-context excludes                           |
+| `Dockerfile`            | base image: node:22 + claude-code + awscli (language- and auth-agnostic) |
+| `overlays/languages/<name>/Dockerfile` | shared language overlays (tracked), chained via `FROM claude-crate:<parent>` |
+| `overlays/projects/<name>/Dockerfile` | private per-project overlays (**gitignored**) |
+| `claude-crate`          | host launcher (auth pre-flight + overlay resolver + `docker run`) |
+| `settings.seed.json[.example]` | Bedrock seed — copy the `.example`, fill in ARNs (real file gitignored) |
+| `settings.seed.api.json[.example]` | Anthropic-API seed — copy the `.example`, plain model names (real file gitignored) |
+| `claude-json.seed.json` | onboarding/theme state seeded into the config dir |
 
 ## Notes
 
-- Each project is mounted at its real host path inside the container (not
-  `/workspace`), so resume history stays scoped per project. The host path is
-  visible inside the container; isolation is unchanged (only that one dir is
-  mounted).
-- macOS: the project dir, `~/.aws`, and `~/.claude-crate` must be under paths
-  Docker Desktop is allowed to share (your home dir is by default).
+- macOS: the project dir, `~/.aws`, and config dirs must be under paths Docker
+  Desktop is allowed to share (your home dir is by default).
 - Egress is unrestricted in v1 (default Docker networking).
